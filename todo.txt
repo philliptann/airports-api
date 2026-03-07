@@ -1,0 +1,11 @@
+When you’re ready, the natural next upgrades (in sensible order) would be:
+
+Distance-to-threshold calculation
+
+Nearest-airport search
+
+Wind component calculator (headwind/crosswind)
+
+Auto runway selection based on wind + alignment
+
+Magnetic variation support (if you want pilot-facing runway numbers)
