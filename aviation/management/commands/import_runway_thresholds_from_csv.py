@@ -71,9 +71,36 @@ def ident_parts(value):
     return None, None, v
 
 
-def is_standard_runway_ident(value):
-    num, _suffix, _norm = ident_parts(value)
-    return num is not None
+def norm_surface(value):
+    """
+    Normalise common surface values to a small set for matching.
+    """
+    v = clean(value)
+    if v is None:
+        return None
+
+    v = v.upper()
+
+    mapping = {
+        "ASP": "ASP",
+        "ASPHALT": "ASP",
+        "BITUMINOUS": "ASP",
+        "TARMAC": "ASP",
+        "CON": "CON",
+        "CONCRETE": "CON",
+        "GRS": "GRS",
+        "GRASS": "GRS",
+        "TURF": "GRS",
+        "TUF": "GRS",
+        "GRE": "GRS",
+        "GRAVEL": "GRAVEL",
+        "GVL": "GRAVEL",
+        "DIRT": "DIRT",
+        "SAND": "SAND",
+        "WATER": "WATER",
+    }
+
+    return mapping.get(v, v)
 
 
 def pair_matches(csv_le, csv_he, db_le, db_he, allow_heading_tolerance=True):
@@ -82,12 +109,12 @@ def pair_matches(csv_le, csv_he, db_le, db_he, allow_heading_tolerance=True):
       (matched: bool, reversed_match: bool, mode: str)
 
     Modes:
-      exact               07/25 == 07/25
-      reversed            25/07 == 07/25
-      base_exact          07/25 == 07L/25R
-      base_reversed       25/07 == 07L/25R
-      tolerance_exact     07/25 ~= 08/26
-      tolerance_reversed  25/07 ~= 08/26
+      exact
+      reversed
+      base_exact
+      base_reversed
+      tolerance_exact
+      tolerance_reversed
     """
     csv_le_num, _csv_le_suffix, csv_le_norm = ident_parts(csv_le)
     csv_he_num, _csv_he_suffix, csv_he_norm = ident_parts(csv_he)
@@ -123,6 +150,47 @@ def pair_matches(csv_le, csv_he, db_le, db_he, allow_heading_tolerance=True):
     return False, False, ""
 
 
+def resolve_ambiguous_match(best_matches, csv_surface, csv_length_ft):
+    """
+    Try to reduce ambiguous candidates using:
+      1) surface
+      2) closest length
+
+    Returns:
+      (selected_match or None, resolution_note:str)
+    """
+    candidates = best_matches
+
+    csv_surface_norm = norm_surface(csv_surface)
+    if csv_surface_norm is not None:
+        surface_matches = [
+            m for m in candidates
+            if norm_surface(m[0].surface) == csv_surface_norm
+        ]
+        if len(surface_matches) == 1:
+            return surface_matches[0], "surface"
+
+        if len(surface_matches) > 1:
+            candidates = surface_matches
+
+    if csv_length_ft is not None and candidates:
+        length_deltas = []
+        for m in candidates:
+            db_len = m[0].length_ft
+            if db_len is None:
+                continue
+            length_deltas.append((abs(db_len - csv_length_ft), m))
+
+        if length_deltas:
+            length_deltas.sort(key=lambda x: x[0])
+            best_delta = length_deltas[0][0]
+            tied = [m for delta, m in length_deltas if delta == best_delta]
+            if len(tied) == 1:
+                return tied[0], "length"
+
+    return None, ""
+
+
 class Command(BaseCommand):
     help = "Import missing runway threshold coords/elevations from CSV"
 
@@ -146,6 +214,7 @@ class Command(BaseCommand):
         not_found = 0
         reversed_matches = 0
         ambiguous_matches = 0
+        disambiguated_matches = 0
 
         report_rows = []
 
@@ -162,6 +231,9 @@ class Command(BaseCommand):
 
                 if not airport_ident or not csv_le_ident:
                     continue
+
+                csv_surface = clean(row.get("surface"))
+                csv_length_ft = clean_int(row.get("length_ft"))
 
                 csv_le_lat = clean_float(row.get("le_latitude_deg"))
                 csv_le_lon = clean_float(row.get("le_longitude_deg"))
@@ -181,6 +253,8 @@ class Command(BaseCommand):
                         "csv_he_ident": csv_he_ident_raw,
                         "norm_le_ident": csv_le_ident,
                         "norm_he_ident": csv_he_ident,
+                        "csv_surface": csv_surface,
+                        "csv_length_ft": row.get("length_ft"),
                         "reason": "airport not found in runway table",
                         "match_mode": "",
                         "db_candidate_pairs": "",
@@ -212,7 +286,6 @@ class Command(BaseCommand):
                     if matched:
                         matches.append((candidate, reversed_match, mode))
 
-                # No matches at all
                 if not matches:
                     not_found += 1
                     candidate_pairs = "; ".join(
@@ -224,6 +297,8 @@ class Command(BaseCommand):
                         "csv_he_ident": csv_he_ident_raw,
                         "norm_le_ident": csv_le_ident,
                         "norm_he_ident": csv_he_ident,
+                        "csv_surface": csv_surface,
+                        "csv_length_ft": row.get("length_ft"),
                         "reason": "no matching runway for airport",
                         "match_mode": "",
                         "db_candidate_pairs": candidate_pairs,
@@ -243,7 +318,6 @@ class Command(BaseCommand):
                     )
                     continue
 
-                # Prefer stronger match modes first
                 mode_rank = {
                     "exact": 0,
                     "reversed": 1,
@@ -256,11 +330,24 @@ class Command(BaseCommand):
                 best_rank = mode_rank[matches[0][2]]
                 best_matches = [m for m in matches if mode_rank[m[2]] == best_rank]
 
-                # Ambiguous best match => do not auto-update
+                resolution_note = ""
+
+                if len(best_matches) > 1:
+                    resolved, resolution_note = resolve_ambiguous_match(
+                        best_matches,
+                        csv_surface=csv_surface,
+                        csv_length_ft=csv_length_ft,
+                    )
+                    if resolved is not None:
+                        best_matches = [resolved]
+                        disambiguated_matches += 1
+
                 if len(best_matches) > 1:
                     ambiguous_matches += 1
                     candidate_pairs = "; ".join(
-                        f"{m[0].le_ident}/{m[0].he_ident} [{m[2]}]" for m in best_matches
+                        f"{m[0].le_ident}/{m[0].he_ident} "
+                        f"[{m[2]}|surf={m[0].surface}|len={m[0].length_ft}]"
+                        for m in best_matches
                     )
                     report_rows.append({
                         "airport_ident": airport_ident,
@@ -268,6 +355,8 @@ class Command(BaseCommand):
                         "csv_he_ident": csv_he_ident_raw,
                         "norm_le_ident": csv_le_ident,
                         "norm_he_ident": csv_he_ident,
+                        "csv_surface": csv_surface,
+                        "csv_length_ft": row.get("length_ft"),
                         "reason": "ambiguous runway match",
                         "match_mode": best_matches[0][2],
                         "db_candidate_pairs": candidate_pairs,
@@ -321,6 +410,8 @@ class Command(BaseCommand):
                 if changed:
                     updated_rows += 1
                     note = f" [{match_mode}]"
+                    if resolution_note:
+                        note += f" [disambiguated:{resolution_note}]"
                     if matched_reversed:
                         note += " [reversed]"
                     self.stdout.write(
@@ -342,6 +433,8 @@ class Command(BaseCommand):
                         "csv_he_ident",
                         "norm_le_ident",
                         "norm_he_ident",
+                        "csv_surface",
+                        "csv_length_ft",
                         "reason",
                         "match_mode",
                         "db_candidate_pairs",
@@ -360,6 +453,7 @@ class Command(BaseCommand):
             self.style.SUCCESS(
                 f"Done. Updated {updated_rows} runways. "
                 f"Reversed matches: {reversed_matches}. "
+                f"Disambiguated: {disambiguated_matches}. "
                 f"Ambiguous: {ambiguous_matches}. "
                 f"Unchanged: {unchanged_rows}. "
                 f"Not found: {not_found}. "
